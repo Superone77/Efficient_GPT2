@@ -8,6 +8,12 @@ from collections import defaultdict
 
 import torch
 from torch.utils.data.dataloader import DataLoader
+import torch.distributed as dist
+import multiprocessing as mp
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, CPUOffload
+import os
+from torch.utils.data.distributed import DistributedSampler
+
 from mingpt.utils import CfgNode as CN
 
 class Trainer:
@@ -26,6 +32,8 @@ class Trainer:
         C.betas = (0.9, 0.95)
         C.weight_decay = 0.1 # only applied on matmul weights
         C.grad_norm_clip = 1.0
+        C.cross_batch_num = 1
+        C.use_fsdp = False
         return C
 
     def __init__(self, config, model, train_dataset):
@@ -34,13 +42,23 @@ class Trainer:
         self.optimizer = None
         self.train_dataset = train_dataset
         self.callbacks = defaultdict(list)
+        self.use_fsdp = confit.use_fsdp
 
         # determine the device we'll train on
-        if config.device == 'auto':
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if self.use_fsdp:
+            dist.init_process_group(backend="nccl")
+            self.local_rank = int(os.env.get("LOCAL_RANK",0))
+            print(">>> local_rank: ", self.local_rank)
+            torch.cuda.set_device(self.local_rank)
+            self.device = torch.device("cuda", self.local_rank)
+            self.model = self.model.to(self.local_rank)
+            self.model = FSDP(self.model)
         else:
-            self.device = config.device
-        self.model = self.model.to(self.device)
+            if config.device == 'auto':
+                self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            else:
+                self.device = config.device
+            self.model = self.model.to(self.device)
         print("running on device", self.device)
 
         # variables that will be assigned to trainer class later for logging and etc
@@ -65,37 +83,51 @@ class Trainer:
         self.optimizer = model.configure_optimizers(config)
 
         # setup the dataloader
-        train_loader = DataLoader(
-            self.train_dataset,
-            sampler=torch.utils.data.RandomSampler(self.train_dataset, replacement=True, num_samples=int(1e10)),
-            shuffle=False,
-            pin_memory=True,
-            batch_size=config.batch_size,
-            num_workers=config.num_workers,
-        )
+        if self.use_fsdp:
+            train_sampler = DistributedSampler(self.train_dataset)
+            self.train_loader = DataLoader(
+                self.train_dataset,
+                sampler=train_sampler,
+                shuffle=False,
+                pin_memory=True,
+                batch_size=config.batch_size,
+                num_workers=config.num_workers,
+            )
+        else:
+            train_sampler = torch.utils.data.RandomSampler(self.train_dataset, replacement=True, num_samples=int(1e10))
+            self.train_loader = DataLoader(
+                self.train_dataset,
+                sampler=train_sampler,
+                shuffle=False,
+                pin_memory=True,
+                batch_size=config.batch_size,
+                num_workers=config.num_workers,
+            )
 
         model.train()
         self.iter_num = 0
         self.iter_time = time.time()
-        data_iter = iter(train_loader)
+        data_iter = iter(self.train_loader)
+        steps = self.config.cross_batch_num
         while True:
 
             # fetch the next batch (x, y) and re-init iterator if needed
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(train_loader)
-                batch = next(data_iter)
-            batch = [t.to(self.device) for t in batch]
-            x, y = batch
+            for i in range(steps):
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(train_loader)
+                    batch = next(data_iter)
+                batch = [t.to(self.device) for t in batch]
+                x, y = batch
 
-            # forward the model
-            logits, self.loss = model(x, y)
+                # forward the model
+                logits, self.loss = model(x, y)
 
-            # backprop and update the parameters
-            model.zero_grad(set_to_none=True)
-            self.loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
+                # backprop and update the parameters
+                model.zero_grad(set_to_none=True)
+                self.loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
             self.optimizer.step()
 
             self.trigger_callbacks('on_batch_end')
@@ -107,3 +139,6 @@ class Trainer:
             # termination conditions
             if config.max_iters is not None and self.iter_num >= config.max_iters:
                 break
+
+        if self.use_fsdp:
+            dist.destroy_process_group()

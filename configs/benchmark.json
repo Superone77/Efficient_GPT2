@@ -1,0 +1,16 @@
+{
+    "model_config": {
+      "model_type": "gpt2-xl",      
+      "use_checkpoint": false       
+    },
+    "train_config": {
+      "learning_rate": 5e-4,        
+      "batch_size": 128,             
+      "cross_batch_num": 1,         
+      "num_workers": 0,             
+      "total_num_train_data": 10240,
+      "foreach_opt_flag": true,     
+      "device": "cuda:2",           
+      "use_fsdp": false             
+    }
+  }

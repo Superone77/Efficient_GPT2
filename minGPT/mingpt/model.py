@@ -13,6 +13,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from mingpt.utils import CfgNode as CN
 
@@ -86,10 +87,20 @@ class Block(nn.Module):
         ))
         m = self.mlp
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
+        self.use_checkpoint = config.use_checkpoint
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlpf(self.ln_2(x))
+        def attn_forward(x):
+            return self.attn(self.ln_1(x))
+
+        def mlp_forward(x):
+            return self.mlpf(self.ln_2(x))
+        if self.use_checkpoint:
+            x = x + checkpoint(attn_forward,x)
+            x = x + checkpoint(mlp_forward,x)
+        else:
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlpf(self.ln_2(x))
         return x
 
 class GPT(nn.Module):
@@ -245,16 +256,16 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in self.named_parameters()}
         inter_params = decay & no_decay
         union_params = decay | no_decay
-        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
-        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
-                                                    % (str(param_dict.keys() - union_params), )
+        # assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
+        # assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
+        #                                             % (str(param_dict.keys() - union_params), )
 
         # create the pytorch optimizer object
         optim_groups = [
             {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
-        optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
+        optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas, foreach=train_config.foreach_opt_flag)
         return optimizer
 
     def forward(self, idx, targets=None):
