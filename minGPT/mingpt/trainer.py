@@ -13,11 +13,46 @@ import multiprocessing as mp
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, CPUOffload
 import os
 from torch.utils.data.distributed import DistributedSampler
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
 
 from mingpt.utils import CfgNode as CN
 
-class Trainer:
+class TorchProfiler:
+    def __init__(
+        self,
+        log_dir="./log",
+        profile_memory=True,
+        record_shapes=True,
+        with_stack=True,
+        wait=1,
+        warmup=1,
+        active=3,
+        repeat=2,
+    ):
+        self.log_dir = log_dir
+        self.profile_memory = profile_memory
+        self.record_shapes = record_shapes
+        self.with_stack = with_stack
+        self.schedule = schedule(wait=wait, warmup=warmup, active=active, repeat=repeat)
 
+    def __enter__(self):
+        self.profiler = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=self.schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(self.log_dir),
+            profile_memory=self.profile_memory,
+            record_shapes=self.record_shapes,
+            with_stack=self.with_stack,
+        )
+        self.profiler.__enter__()
+        return self.profiler
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.profiler.__exit__(exc_type, exc_val, exc_tb)
+        print(self.profiler.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+
+
+class Trainer:
     @staticmethod
     def get_default_config():
         C = CN()
